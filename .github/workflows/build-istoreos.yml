@@ -1,14 +1,20 @@
-name: Build iStoreOS for NanoPi R1S-H3
+name: Build ImmortalWrt for NanoPi R1S-H3
 
 on:
   workflow_dispatch:
+    inputs:
+      custom_feed_url:
+        description: '添加自定义软件源地址 (例如: https://github.com/ ...)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Initialization Environment
         env:
@@ -21,6 +27,18 @@ jobs:
             file wget swig libelf-dev libgmp-dev libltdl-dev libmpc-dev libmpfr-dev \
             libtool ninja-build p7zip p7zip-full qemu-utils u-boot-tools upx-ucl xxd
 
+      - name: Add Custom Feeds from Web Input
+        run: |
+          if [ -n "${{ inputs.custom_feed_url }}" ]; then
+            echo "检测到自定义源输入，正在添加: ${{ inputs.custom_feed_url }}"
+            echo "src-git custom_feed ${{ inputs.custom_feed_url }}" >> feeds.conf.default
+          else
+            echo "未输入自定义源，跳过..."
+          fi
+
+          echo "=== 当前 Feeds 配置文件内容 ==="
+          cat feeds.conf.default
+
       - name: Update Feeds
         run: |
           ./scripts/feeds update -a
@@ -28,14 +46,17 @@ jobs:
 
       - name: Update Configuration and DTS
         run: |
-          # 1. 针对 NanoPi R1S-H3 写入硬件目标配置
+          cp r1s-h3.config.seed .config
+
+          # 1. 完整保留架构与设备目标
           echo "CONFIG_TARGET_sunxi=y" >> .config
           echo "CONFIG_TARGET_sunxi_cortexa7=y" >> .config
           echo "CONFIG_TARGET_sunxi_cortexa7_DEVICE_friendlyarm_nanopi-r1s-h3=y" >> .config
-          
-          # 2. 开启 iStore 应用商店及常用网络组件
-          echo "CONFIG_PACKAGE_luci-app-istore=y" >> .config
+
+          # 2. 补全无线网卡驱动、底层总线、无线工具、中文语言支持及软件源/软件包管理界面
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-opkg=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-opkg-zh-Hans=y" >> .config
           echo "CONFIG_PACKAGE_kmod-usb-net-rtl8152=y" >> .config
           echo "CONFIG_PACKAGE_kmod-brcmfmac=y" >> .config
           echo "CONFIG_PACKAGE_kmod-brcmutil=y" >> .config
@@ -46,20 +67,21 @@ jobs:
           echo "CONFIG_PACKAGE_iw=y" >> .config
           echo "CONFIG_PACKAGE_iwinfo=y" >> .config
           echo "CONFIG_PACKAGE_wpad-basic-mbedtls=y" >> .config
-          
-          # 3. 核心：开启 Docker 容器可用的 rootfs.tar.gz 压缩包输出
+
+          # 3. 开启 Docker/容器可用的 rootfs.tar.gz 压缩包输出
           echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
-          
-          # 4. 修复 DTS 文件中的 mmc2 (SDIO WiFi) 状态为 okay
+
+          # 4. 修复 DTS 文件中的 mmc2 (SDIO WiFi) 禁用状态为 okay
           DTS_FILE=$(find target/linux/sunxi/ -iname "*nanopi*r1s*.dts" 2>/dev/null | head -n 1)
           if [ -n "$DTS_FILE" ]; then
             sed -i '/&mmc2/,/};/s/status = "disabled";/status = "okay";/' "$DTS_FILE"
           fi
-          
-          # 5. 植入开机固定 MAC、静态 IP 及 DHCP 初始化脚本
+
+          # 5. 植入开机固定 MAC、静态 IP 及 DHCP 极速响应初始化脚本
           mkdir -p files/etc/uci-defaults
           cat << 'EOF' > files/etc/uci-defaults/99-custom-network-settings
           #!/bin/sh
+
           uci set network.lan=interface
           uci set network.lan.device='br-lan'
           uci set network.lan.proto='static'
@@ -68,10 +90,12 @@ jobs:
           uci set network.lan.stp='0'
           uci set network.lan.delegate='0'
           uci set network.lan.force_link='1'
+
           uci set network.@device[0]=device
           uci set network.@device[0].name='br-lan'
           uci set network.@device[0].type='bridge'
           uci set network.@device[0].macaddr='02:42:ac:11:00:02'
+
           uci set dhcp.lan=dhcp
           uci set dhcp.lan.interface='lan'
           uci set dhcp.lan.start='100'
@@ -79,14 +103,14 @@ jobs:
           uci set dhcp.lan.leasetime='12h'
           uci set dhcp.lan.authoritative='1'
           uci set dhcp.lan.force='1'
+
           uci commit network
           uci commit dhcp
           EOF
           chmod +x files/etc/uci-defaults/99-custom-network-settings
-          
-          # 6. 生成配置并同步内核选项防卡死
+
           make defconfig
-          make kernel_olddefconfig || true
+          make kernel_olddefconfig
 
       - name: Download Package Toolchain
         run: |
@@ -100,27 +124,39 @@ jobs:
       - name: Organize Artifacts
         run: |
           mkdir -p bin/out
+
+          echo "=== 正在精准提取 NanoPi R1 固件及 Armbian Docker 容器包 ==="
           BUILD_DATE=$(date +%Y%m%d)
-          
-          # 提取 iStoreOS 专属的 rootfs 容器包
-          for file in bin/targets/sunxi/cortexa7/*rootfs.tar.gz; do
-            if [ -f "$file" ]; then
-              new_filename="istoreos-sunxi-cortexa7-rootfs-$BUILD_DATE.tar.gz"
-              cp -f "$file" "bin/out/$new_filename"
-              echo "已提取 iStoreOS 容器包: $new_filename"
-            fi
-          done
-          
-          # 同时提取物理镜像备用
-          for file in bin/targets/sunxi/cortexa7/*.img.gz; do
+
+          # 1. 提取常规刷机镜像 (.img.gz)
+          for file in bin/targets/sunxi/cortexa7/*nanopi-r1*.img.gz; do
             if [ -f "$file" ]; then
               filename=$(basename "$file")
-              cp -f "$file" "bin/out/${filename%.img.gz}-$BUILD_DATE.img.gz"
+              new_filename="${filename%.img.gz}-$BUILD_DATE.img.gz"
+              cp -f "$file" "bin/out/$new_filename"
+              echo "已重命名镜像: $filename -> $new_filename"
             fi
           done
+
+          # 2. 提取适用于 Armbian Docker 的 rootfs 压缩包
+          for file in bin/targets/sunxi/cortexa7/*rootfs.tar.gz; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              new_filename="immortalwrt-sunxi-cortexa7-rootfs-$BUILD_DATE.tar.gz"
+              cp -f "$file" "bin/out/$new_filename"
+              echo "已提取 Docker 容器包: $filename -> $new_filename"
+            fi
+          done
+
+          if [ -f "bin/targets/sunxi/cortexa7/sha256sums" ]; then
+            cp -f bin/targets/sunxi/cortexa7/sha256sums bin/out/
+          fi
+
+          echo "=== 打包输出目录清单 ==="
+          ls -lh bin/out/
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: iStoreOS-NanoPi-R1S-H3-Docker
+          name: ImmortalWrt-NanoPi-R1S-H3
           path: bin/out/*
