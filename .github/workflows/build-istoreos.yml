@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       custom_feed_url:
-        description: '添加自定义软件源地址 (例如: https://github.com/ ...)'
+        description: '添加自定义软件源地址 (例如: https://...)'
         required: false
         default: ''
         type: string
@@ -46,14 +46,15 @@ jobs:
 
       - name: Update Configuration and DTS
         run: |
-          cp r1s-h3.config.seed .config
+          # 1. 初始化基础配置
+          make defconfig
 
-          # 1. 完整保留架构与设备目标
+          # 2. 完整保留架构与设备目标
           echo "CONFIG_TARGET_sunxi=y" >> .config
           echo "CONFIG_TARGET_sunxi_cortexa7=y" >> .config
           echo "CONFIG_TARGET_sunxi_cortexa7_DEVICE_friendlyarm_nanopi-r1s-h3=y" >> .config
 
-          # 2. 补全无线网卡驱动、底层总线、无线工具、中文语言支持及软件源/软件包管理界面
+          # 3. 补全无线网卡驱动、底层总线、无线工具、中文语言支持及软件源/软件包管理界面
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-opkg=y" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-opkg-zh-Hans=y" >> .config
@@ -68,16 +69,16 @@ jobs:
           echo "CONFIG_PACKAGE_iwinfo=y" >> .config
           echo "CONFIG_PACKAGE_wpad-basic-mbedtls=y" >> .config
 
-          # 3. 开启 Docker/容器可用的 rootfs.tar.gz 压缩包输出
+          # 4. 开启 Docker/容器可用的 rootfs.tar.gz 压缩包输出
           echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
 
-          # 4. 修复 DTS 文件中的 mmc2 (SDIO WiFi) 禁用状态为 okay
+          # 5. 修复 DTS 文件中的 mmc2 (SDIO WiFi) 禁用状态为 okay
           DTS_FILE=$(find target/linux/sunxi/ -iname "*nanopi*r1s*.dts" 2>/dev/null | head -n 1)
           if [ -n "$DTS_FILE" ]; then
             sed -i '/&mmc2/,/};/s/status = "disabled";/status = "okay";/' "$DTS_FILE"
           fi
 
-          # 5. 植入开机固定 MAC、静态 IP 及 DHCP 极速响应初始化脚本
+          # 6. 植入开机固定 MAC、静态 IP 及 DHCP 极速响应初始化脚本
           mkdir -p files/etc/uci-defaults
           cat << 'EOF' > files/etc/uci-defaults/99-custom-network-settings
           #!/bin/sh
@@ -109,6 +110,7 @@ jobs:
           EOF
           chmod +x files/etc/uci-defaults/99-custom-network-settings
 
+          # 7. 再次同步配置并自动处理新增内核选项
           make defconfig
           make kernel_olddefconfig
 
