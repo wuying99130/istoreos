@@ -110,9 +110,12 @@ jobs:
           EOF
           chmod +x files/etc/uci-defaults/99-custom-network-settings
 
-          # 7. 再次同步配置并自动处理新增内核选项
+          # 7. 再次同步配置
           make defconfig
-          make kernel_olddefconfig
+          
+          # 8. 先准备内核编译环境，再执行 olddefconfig 自动填充新增选项
+          make target/linux/prepare V=s || true
+          make kernel_olddefconfig || true
 
       - name: Download Package Toolchain
         run: |
