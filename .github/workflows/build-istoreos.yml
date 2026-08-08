@@ -1,0 +1,124 @@
+name: Build iStoreOS for NanoPi R1S-H3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison gawk g++-multilib g++ \
+            gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
+            file wget swig libelf-dev libgmp-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libtool ninja-build p7zip p7zip-full qemu-utils u-boot-tools upx-ucl xxd
+
+      - name: Update Feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Update Configuration and DTS
+        run: |
+          # 1. 针对 NanoPi R1S-H3 写入硬件目标配置
+          echo "CONFIG_TARGET_sunxi=y" >> .config
+          echo "CONFIG_TARGET_sunxi_cortexa7=y" >> .config
+          echo "CONFIG_TARGET_sunxi_cortexa7_DEVICE_friendlyarm_nanopi-r1s-h3=y" >> .config
+          
+          # 2. 开启 iStore 应用商店及常用网络组件
+          echo "CONFIG_PACKAGE_luci-app-istore=y" >> .config
+          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-usb-net-rtl8152=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-brcmfmac=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-brcmutil=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-cfg80211=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-mmc=y" >> .config
+          echo "CONFIG_PACKAGE_brcmfmac-firmware-43430-sdio=y" >> .config
+          echo "CONFIG_PACKAGE_cypress-firmware-43430-sdio=y" >> .config
+          echo "CONFIG_PACKAGE_iw=y" >> .config
+          echo "CONFIG_PACKAGE_iwinfo=y" >> .config
+          echo "CONFIG_PACKAGE_wpad-basic-mbedtls=y" >> .config
+          
+          # 3. 核心：开启 Docker 容器可用的 rootfs.tar.gz 压缩包输出
+          echo "CONFIG_TARGET_ROOTFS_TARGZ=y" >> .config
+          
+          # 4. 修复 DTS 文件中的 mmc2 (SDIO WiFi) 状态为 okay
+          DTS_FILE=$(find target/linux/sunxi/ -iname "*nanopi*r1s*.dts" 2>/dev/null | head -n 1)
+          if [ -n "$DTS_FILE" ]; then
+            sed -i '/&mmc2/,/};/s/status = "disabled";/status = "okay";/' "$DTS_FILE"
+          fi
+          
+          # 5. 植入开机固定 MAC、静态 IP 及 DHCP 初始化脚本
+          mkdir -p files/etc/uci-defaults
+          cat << 'EOF' > files/etc/uci-defaults/99-custom-network-settings
+          #!/bin/sh
+          uci set network.lan=interface
+          uci set network.lan.device='br-lan'
+          uci set network.lan.proto='static'
+          uci set network.lan.ipaddr='192.168.1.1'
+          uci set network.lan.netmask='255.255.255.0'
+          uci set network.lan.stp='0'
+          uci set network.lan.delegate='0'
+          uci set network.lan.force_link='1'
+          uci set network.@device[0]=device
+          uci set network.@device[0].name='br-lan'
+          uci set network.@device[0].type='bridge'
+          uci set network.@device[0].macaddr='02:42:ac:11:00:02'
+          uci set dhcp.lan=dhcp
+          uci set dhcp.lan.interface='lan'
+          uci set dhcp.lan.start='100'
+          uci set dhcp.lan.limit='150'
+          uci set dhcp.lan.leasetime='12h'
+          uci set dhcp.lan.authoritative='1'
+          uci set dhcp.lan.force='1'
+          uci commit network
+          uci commit dhcp
+          EOF
+          chmod +x files/etc/uci-defaults/99-custom-network-settings
+          
+          make defconfig
+
+      - name: Download Package Toolchain
+        run: |
+          make download -j8
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Compile Firmware
+        run: |
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Organize Artifacts
+        run: |
+          mkdir -p bin/out
+          BUILD_DATE=$(date +%Y%m%d)
+          
+          # 提取 iStoreOS 专属的 rootfs 容器包
+          for file in bin/targets/sunxi/cortexa7/*rootfs.tar.gz; do
+            if [ -f "$file" ]; then
+              new_filename="istoreos-sunxi-cortexa7-rootfs-$BUILD_DATE.tar.gz"
+              cp -f "$file" "bin/out/$new_filename"
+              echo "已提取 iStoreOS 容器包: $new_filename"
+            fi
+          done
+          
+          # 同时提取物理镜像备用
+          for file in bin/targets/sunxi/cortexa7/*.img.gz; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              cp -f "$file" "bin/out/${filename%.img.gz}-$BUILD_DATE.img.gz"
+            fi
+          done
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: iStoreOS-NanoPi-R1S-H3-Docker
+          path: bin/out/*
